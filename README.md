@@ -134,20 +134,20 @@ print(json.dumps(result, indent=2))
 
 ## Build and package
 
-```bash
-# Build Lambda zip for deployment
-./package.sh
+Use `package.sh` to build the Lambda zip locally and upload it to your own S3 bucket:
 
-# Publish zip + CloudFormation template to S3 releases bucket
-./publish.sh
+```bash
+RELEASES_BUCKET=my-bucket ./package.sh
 ```
+
+This installs dependencies, strips Lambda-provided packages (boto3/botocore), zips the source, and uploads to `s3://my-bucket/lambda/latest.zip`.
 
 ---
 
 ## Project structure
 
 ```
-netway_agent/
+netway_lambda/
   lambda_handler.py          Entry point — Athena setup, aggregation, API POST
   netway/
     config.py                Environment variable validation
