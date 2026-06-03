@@ -1,0 +1,12 @@
+# Optional heavy dependencies — only needed for specific providers.
+# Add these to requirements.txt before packaging if the deployment uses them.
+#
+# LLM providers (LLM_PROVIDER=anthropic / groq / gemini)
+anthropic>=0.25.0
+groq>=0.9.0
+google-generativeai>=0.7.0
+#
+# GCP cloud provider (CLOUD_PROVIDER=gcp)
+google-cloud-bigquery>=3.0.0
+google-cloud-logging>=3.0.0
+google-cloud-compute>=1.0.0

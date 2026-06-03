@@ -1,0 +1,580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Netway Egress Fee Optimizer
+
+Parameters:
+  NetwayApiKey:
+    Type: String
+    NoEcho: true
+
+  NetwayApiUrl:
+    Type: String
+    Default: https://api.getnetway.dev
+    Description: Netway API server URL
+
+  VpcIds:
+    Type: String
+    Default: "ALL"
+    Description: >
+      Comma-separated VPC IDs to monitor (e.g. vpc-abc123,vpc-def456).
+      Use ALL to monitor every VPC in this region.
+      Leave empty to skip automatic flow log setup if you have already configured VPC Flow Logs manually.
+
+  MinMonthlySaving:
+    Type: Number
+    Default: 100
+    Description: Minimum monthly saving (USD) to report a finding. Use 1 for testing.
+
+  MinBytesPerFlow:
+    Type: Number
+    Default: 1073741824
+    Description: Minimum bytes per flow to include in analysis. Use 1 for testing (default 1GB filters test traffic).
+
+  AnalysisDays:
+    Type: Number
+    Default: 30
+
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 37
+    Description: Days to retain VPC Flow Logs in S3. Must be >= AnalysisDays + 7. Default 37 covers the 30-day analysis window with a 7-day buffer.
+
+  MarketplaceProductCode:
+    Type: String
+    Default: ""
+    Description: AWS Marketplace product code (leave empty for non-Marketplace deployments)
+
+  MarketplaceEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true for AWS Marketplace deployments to enable metering
+
+  ExistingBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Leave empty (default) to let the stack create the Netway S3 bucket.
+      If the bucket netway-<AccountId>-<Region> already exists (e.g. from a
+      previous stack that was torn down), pass its name here to adopt it
+      instead of creating a new one.
+
+Conditions:
+  CreateBucket: !Equals [!Ref ExistingBucketName, ""]
+
+Resources:
+
+  # ── Bootstrap: copy Lambda zip into a local S3 bucket ───────────────────────
+  # The Netway Lambda zip is hosted in ap-south-1. CloudFormation requires the
+  # source bucket to be in the same region as the Lambda. This Custom Resource
+  # downloads the zip at stack-create time and places it in a local bucket so
+  # the stack can be deployed to any region without pre-creating regional buckets.
+
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "netway-bootstrap-${AWS::AccountId}-${AWS::Region}"
+
+  BootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BootstrapPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${BootstrapBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  BootstrapFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "netway-bootstrap-${AWS::Region}"
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt BootstrapRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+
+          def cfn_send(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": str(data or ""),
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data if isinstance(data, dict) else {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+                  method="PUT",
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  bucket = props["Bucket"]
+                  key = props["Key"]
+                  source_url = props["SourceUrl"]
+
+                  if event["RequestType"] == "Delete":
+                      try:
+                          boto3.client("s3").delete_object(Bucket=bucket, Key=key)
+                      except Exception:
+                          pass
+                      cfn_send(event, context, "SUCCESS")
+                      return
+
+                  # Download zip from public URL and upload to the local bucket
+                  with urllib.request.urlopen(source_url) as resp:
+                      data = resp.read()
+                  boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=data)
+                  cfn_send(event, context, "SUCCESS", {"Bucket": bucket, "Key": key})
+              except Exception as e:
+                  cfn_send(event, context, "FAILED", {"Error": str(e)})
+
+  BootstrapResource:
+    Type: Custom::BootstrapLambdaZip
+    DependsOn: BootstrapBucket
+    Properties:
+      ServiceToken: !GetAtt BootstrapFunction.Arn
+      Bucket: !Ref BootstrapBucket
+      Key: lambda/latest.zip
+      SourceUrl: https://netway-public-releases.s3.amazonaws.com/lambda/latest.zip
+      # Bump SourceVersion to force re-download on stack update (e.g. after a Lambda release)
+      SourceVersion: "1"
+
+  # ── S3 (flow logs + Athena results) ─────────────────────────────────────────
+  NetwayBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "netway-${AWS::AccountId}-${AWS::Region}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireFlowLogs
+            Status: Enabled
+            Prefix: AWSLogs/
+            ExpirationInDays: !Ref FlowLogRetentionDays
+          - Id: ExpireAthenaResults
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          - Id: ExpireAthenaSetup
+            Status: Enabled
+            Prefix: athena-setup/
+            ExpirationInDays: 7
+
+  NetwayBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !If
+              - CreateBucket
+              - !Sub "${NetwayBucket.Arn}/AWSLogs/*"
+              - !Sub "arn:aws:s3:::${ExistingBucketName}/AWSLogs/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AWSLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !If
+              - CreateBucket
+              - !GetAtt NetwayBucket.Arn
+              - !Sub "arn:aws:s3:::${ExistingBucketName}"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ── Flow Log Enabler (Custom Resource) ──────────────────────────────────────
+  # Enables VPC Flow Logs on the specified VPCs → NetwayBucket.
+  # On stack deletion, removes only the flow logs it created (tagged ManagedBy=netway).
+  # Skipped entirely when VpcIds is empty (manual flow log setup).
+
+  FlowLogEnablerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogEnablerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:CreateFlowLogs
+                  - ec2:DeleteFlowLogs
+                  - ec2:DescribeFlowLogs
+                  - ec2:CreateTags
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:ListBucketVersions
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogDelivery
+                  - logs:DeleteLogDelivery
+                Resource: "*"
+
+  FlowLogEnablerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "netway-flow-log-enabler-${AWS::Region}"
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt FlowLogEnablerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+
+          LOG_FORMAT = (
+              "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} "
+              "${srcport} ${dstport} ${protocol} ${packets} ${bytes} "
+              "${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} "
+              "${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} "
+              "${region} ${az-id} ${sublocation-type} ${sublocation-id} "
+              "${pkt-src-aws-service} ${pkt-dst-aws-service} "
+              "${flow-direction} ${traffic-path}"
+          )
+
+          def cfn_send(event, context, status, data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": str(data or ""),
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data if isinstance(data, dict) else {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+                  method="PUT",
+              )
+              urllib.request.urlopen(req)
+
+          def empty_bucket(bucket):
+              s3 = boto3.client('s3')
+              paginator = s3.get_paginator('list_object_versions')
+              for page in paginator.paginate(Bucket=bucket):
+                  objects = [
+                      {'Key': o['Key'], 'VersionId': o['VersionId']}
+                      for o in page.get('Versions', []) + page.get('DeleteMarkers', [])
+                  ]
+                  if objects:
+                      s3.delete_objects(Bucket=bucket, Delete={'Objects': objects})
+
+          def resolve_vpcs(ec2, vpc_ids_param):
+              """Return list of VPC dicts based on VpcIds parameter."""
+              if vpc_ids_param.strip().upper() == 'ALL':
+                  return ec2.describe_vpcs(
+                      Filters=[{'Name': 'state', 'Values': ['available']}]
+                  )['Vpcs']
+              ids = [v.strip() for v in vpc_ids_param.split(',') if v.strip()]
+              if not ids:
+                  return []
+              return ec2.describe_vpcs(VpcIds=ids)['Vpcs']
+
+          def handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  props = event['ResourceProperties']
+
+                  if event['RequestType'] == 'Delete':
+                      # Remove only flow logs created by Netway (tagged ManagedBy=netway)
+                      logs = ec2.describe_flow_logs(
+                          Filters=[{'Name': 'tag:ManagedBy', 'Values': ['netway']}]
+                      )['FlowLogs']
+                      if logs:
+                          ec2.delete_flow_logs(FlowLogIds=[fl['FlowLogId'] for fl in logs])
+                      empty_bucket(props['BucketName'])
+                      cfn_send(event, context, 'SUCCESS')
+                      return
+
+                  bucket_arn = props['BucketArn']
+                  vpc_ids_param = props.get('VpcIds', 'ALL')
+                  vpcs = resolve_vpcs(ec2, vpc_ids_param)
+
+                  if not vpcs:
+                      print("No VPCs found — nothing to configure.")
+                      cfn_send(event, context, 'SUCCESS', {'VpcsConfigured': '0'})
+                      return
+
+                  created = 0
+                  errors = []
+                  for vpc in vpcs:
+                      vpc_id = vpc['VpcId']
+                      try:
+                          resp = ec2.create_flow_logs(
+                              ResourceIds=[vpc_id],
+                              ResourceType='VPC',
+                              TrafficType='ALL',
+                              LogDestinationType='s3',
+                              LogDestination=bucket_arn,
+                              LogFormat=LOG_FORMAT,
+                              MaxAggregationInterval=60,
+                              TagSpecifications=[{
+                                  'ResourceType': 'vpc-flow-log',
+                                  'Tags': [{'Key': 'ManagedBy', 'Value': 'netway'}]
+                              }]
+                          )
+                          created += len(resp.get('FlowLogIds', []))
+                          for u in resp.get('Unsuccessful', []):
+                              code = u.get('Error', {}).get('Code', '')
+                              msg  = u.get('Error', {}).get('Message', '')
+                              if code == 'FlowLogAlreadyExists':
+                                  print(f"Flow log already exists for {vpc_id} — skipping")
+                              else:
+                                  errors.append(f"{vpc_id}: {code} — {msg}")
+                      except Exception as e:
+                          if 'FlowLogAlreadyExists' in str(e):
+                              print(f"Flow log already exists for {vpc_id} (exc) — skipping")
+                          else:
+                              raise
+                  if errors:
+                      raise Exception("Flow log errors: " + "; ".join(errors))
+                  cfn_send(event, context, 'SUCCESS', {'VpcsConfigured': str(created)})
+              except Exception as e:
+                  cfn_send(event, context, 'FAILED', {'Error': str(e)})
+
+  EnableFlowLogs:
+    Type: Custom::FlowLogEnabler
+    DependsOn: NetwayBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt FlowLogEnablerFunction.Arn
+      BucketArn: !If [CreateBucket, !GetAtt NetwayBucket.Arn, !Sub "arn:aws:s3:::${ExistingBucketName}"]
+      BucketName: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
+      VpcIds: !Ref VpcIds
+      # Bump ServiceVersion to force re-run after code or IAM changes
+      ServiceVersion: "3"
+
+  # ── IAM ─────────────────────────────────────────────────────────────────────
+  NetwayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "netway-analyzer-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NetwayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !If [CreateBucket, !GetAtt NetwayBucket.Arn, !Sub "arn:aws:s3:::${ExistingBucketName}"]
+                  - !If [CreateBucket, !Sub "${NetwayBucket.Arn}/*", !Sub "arn:aws:s3:::${ExistingBucketName}/*"]
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:CreateDatabase
+                  - glue:BatchCreatePartition
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeAddresses
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBSubnetGroups
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - lambda:ListFunctions
+                  - sagemaker:ListEndpoints
+                  - sagemaker:ListTrainingJobs
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeCacheClusters
+                  - fsx:DescribeFileSystems
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:MeterUsage
+                Resource: "*"
+
+  # ── Athena ──────────────────────────────────────────────────────────────────
+  NetwayWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: netway-analyzer
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !If
+            - CreateBucket
+            - !Sub "s3://${NetwayBucket}/athena-results/"
+            - !Sub "s3://${ExistingBucketName}/athena-results/"
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB scan limit
+
+  # ── Lambda ──────────────────────────────────────────────────────────────────
+  NetwayFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BootstrapResource
+    Properties:
+      FunctionName: netway-analyzer
+      Runtime: python3.11
+      Handler: lambda_handler.handler
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref BootstrapBucket
+        S3Key: lambda/latest.zip
+      Environment:
+        Variables:
+          NETWAY_API_KEY: !Ref NetwayApiKey
+          NETWAY_API_URL: !Ref NetwayApiUrl
+          FLOW_LOGS_S3_BUCKET: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
+          ATHENA_RESULTS_BUCKET: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
+          ATHENA_WORKGROUP: netway-analyzer
+          ATHENA_DATABASE: netway
+          CLOUD_PROVIDER: aws
+          ANALYSIS_DAYS: !Sub "${AnalysisDays}"
+          FLOW_LOG_SOURCE: s3_athena
+          MIN_MONTHLY_SAVING: !Sub "${MinMonthlySaving}"
+          MIN_BYTES_PER_FLOW: !Sub "${MinBytesPerFlow}"
+          MARKETPLACE_PRODUCT_CODE: !Ref MarketplaceProductCode
+          MARKETPLACE_ENABLED: !Ref MarketplaceEnabled
+      Role: !GetAtt NetwayRole.Arn
+
+  # ── EventBridge ─────────────────────────────────────────────────────────────
+  LambdaPermissionEventBridgeWeekly:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NetwayFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklySchedule.Arn
+
+  LambdaPermissionEventBridgeNewResource:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NetwayFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NewResourceTrigger.Arn
+
+  WeeklySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: netway-weekly-scan
+      ScheduleExpression: rate(7 days)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NetwayFunction.Arn
+          Id: NetwayWeeklyScan
+          Input: '{"trigger": "scheduled"}'
+
+  NewResourceTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: netway-new-resource
+      EventPattern:
+        source: ["aws.ec2"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventName:
+            - RunInstances
+            - CreateVpc
+            - CreateNatGateway
+            - CreateLaunchTemplate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NetwayFunction.Arn
+          Id: NetwayNewResource
+          Input: '{"trigger": "new_resource"}'
+
+Outputs:
+  BucketName:
+    Value: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
+    Description: Netway-managed S3 bucket (flow logs + Athena results, with lifecycle auto-cleanup)
+
+  FunctionArn:
+    Value: !GetAtt NetwayFunction.Arn
+    Description: Netway Lambda function ARN
+
+  RoleArn:
+    Value: !GetAtt NetwayRole.Arn
+    Description: Netway IAM role ARN
+
+  WorkgroupName:
+    Value: !Ref NetwayWorkgroup
+    Description: Athena workgroup with 10GB scan limit

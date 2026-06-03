@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+
+# Build artifacts
+*.zip
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyArmor obfuscation internals
+.pyarmor/
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Athena query results (local testing)
+/tmp/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

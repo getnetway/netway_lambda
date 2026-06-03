@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  netway:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - netway-data:/data
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    profiles:
+      - ollama
+
+volumes:
+  netway-data:
+  ollama-models:
