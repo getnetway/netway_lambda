@@ -1,6 +1,9 @@
 # Secrets — never commit
 .env
 
+# Internal Netlytix release tooling — not for public repo
+publish.sh
+
 # Build artifacts
 *.zip
 build/
