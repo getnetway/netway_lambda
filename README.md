@@ -1,4 +1,4 @@
-# Netway Agent
+# Netway Lambda
 
 The open-source AWS Lambda agent that powers [Netway](https://getnetway.dev) — the VPC flow log analyser that finds and fixes hidden AWS network costs.
 
