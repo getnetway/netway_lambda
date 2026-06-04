@@ -1,6 +1,6 @@
 # Netway Lambda
 
-The open-source AWS Lambda agent that powers [Netway](https://getnetway.dev) — the VPC flow log analyser that finds and fixes hidden AWS network costs.
+The open-source AWS Lambda agent that powers [Netway](https://netway.basavytix.com) — the VPC flow log analyser that finds and fixes hidden AWS network costs.
 
 ---
 
@@ -49,7 +49,7 @@ Your AWS Account
 └───────────────────────────┼─────────────────────────────────┘
                             │  HTTPS  (gzip + HMAC-SHA256)
                             ▼
-                  api.getnetway.dev
+                  api.netway.basavytix.com
                   14 cost detectors
                   Dashboard + alerts
 ```
@@ -62,7 +62,7 @@ The recommended way to deploy is via the CloudFormation template — it creates 
 
 **Prerequisites:**
 - AWS CLI configured (`aws sts get-caller-identity` works)
-- A Netway API key — register free at [getnetway.dev](https://getnetway.dev)
+- A Netway API key — register free at [netway.basavytix.com](https://netway.basavytix.com)
 
 ```bash
 aws cloudformation create-stack \
@@ -71,7 +71,7 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameters \
     ParameterKey=NetwayApiKey,ParameterValue=<your-api-key> \
-    ParameterKey=NetwayApiUrl,ParameterValue=https://api.getnetway.dev \
+    ParameterKey=NetwayApiUrl,ParameterValue=https://netway.basavytix.com \
     ParameterKey=VpcIds,ParameterValue=<vpc-id>
 
 aws cloudformation wait stack-create-complete --stack-name netway-v1
@@ -87,7 +87,7 @@ aws lambda invoke \
   /tmp/result.json && cat /tmp/result.json
 ```
 
-Then open [getnetway.dev/dashboard](https://getnetway.dev/dashboard) to see findings.
+Then open [netway.basavytix.com/dashboard](https://netway.basavytix.com/dashboard) to see findings.
 
 ---
 
@@ -111,7 +111,7 @@ Full policy is in [`cloudformation/netway-deploy.yml`](cloudformation/netway-dep
 
 ```bash
 # Clone
-git clone https://github.com/getnetway/netway_lambda
+git clone https://github.com/basavytix/netway_lambda
 cd netway_lambda
 
 # Install dependencies
@@ -171,7 +171,7 @@ netway_lambda/
 
 ## Contributing
 
-Pull requests are welcome. By submitting a PR you agree to license your contribution under the Apache 2.0 license and assign copyright to Netlytix.
+Pull requests are welcome. By submitting a PR you agree to license your contribution under the Apache 2.0 license and assign copyright to Basavytix.
 
 ---
 
@@ -179,4 +179,4 @@ Pull requests are welcome. By submitting a PR you agree to license your contribu
 
 Apache 2.0 — see [LICENSE](LICENSE).
 
-Built and maintained by [Netlytix](https://getnetway.dev), Bengaluru, India.
+Built and maintained by [Basavytix](https://netway.basavytix.com), Bengaluru, India.
