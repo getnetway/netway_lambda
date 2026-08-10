@@ -143,27 +143,31 @@ The entry point is [`lambda_handler.py`](lambda_handler.py). The posture collect
 **Prerequisites:** AWS CLI configured, Netway API key from [basavytix.com](https://basavytix.com)
 
 ```bash
-aws cloudformation create-stack \
-  --stack-name netway-v1 \
-  --template-url https://netway-public-releases.s3.ap-south-1.amazonaws.com/cloudformation/netway-deploy.yml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameters \
-    ParameterKey=NetwayApiKey,ParameterValue=<your-api-key> \
-    ParameterKey=VpcIds,ParameterValue=ALL
+# 1. Deploy — creates Lambda, Athena workgroup, S3 bucket, IAM role, EventBridge schedule (~3 min)
+./netway-deploy.sh deploy --api-key <your-api-key> --regions us-east-1
 
-aws cloudformation wait stack-create-complete --stack-name netway-v1
+# Deploy to multiple regions at once
+./netway-deploy.sh deploy --api-key <your-api-key> --regions us-east-1,eu-west-1,ap-south-1
+
+# 2. Trigger first scan and wait for results
+./netway-deploy.sh scan --wait
+
+# 3. Check stack status across all deployed regions
+./netway-deploy.sh status
 ```
 
-Creates the Lambda, Athena workgroup, S3 bucket, IAM role, and EventBridge schedule. Takes ~3 minutes.
+Your API key and regions are saved to `~/.netway/` after the first deploy — subsequent commands don't need them repeated.
 
-Trigger a manual scan:
+**All commands:**
 
-```bash
-aws lambda invoke \
-  --function-name netway-analyzer \
-  --region <your-region> \
-  --cli-read-timeout 900 \
-  /tmp/result.json && cat /tmp/result.json
+```
+./netway-deploy.sh deploy   --api-key <key> --regions <r1,r2,...> [--vpcs <ids|ALL>]
+./netway-deploy.sh scan     [--wait]
+./netway-deploy.sh status
+./netway-deploy.sh update   [--yes]      # re-deploy with local template changes
+./netway-deploy.sh upgrade  [--yes]      # pull latest template from S3 and update
+./netway-deploy.sh delete   [--yes]
+./netway-deploy.sh outputs
 ```
 
 ---
