@@ -1,6 +1,6 @@
 # Netway
 
-VPC observability for AWS — network cost leak detection, compliance gap identification, VPC network visibility, and topology change history. One CloudFormation stack, one daily scan.
+VPC observability for AWS — network visibility, topology change history, compliance gap identification, and cost leak detection. One CloudFormation stack, one daily scan.
 
 **This repo** is the open-source Lambda agent that runs inside your AWS account. Detection logic, dashboard, and alerts run on hosted infrastructure at [basavytix.com](https://basavytix.com).
 
@@ -21,21 +21,24 @@ AWS makes it easy to start but hard to understand what's actually running and wh
 
 ## What Netway does
 
-### Network cost leak detection
+### 1. VPC network visibility
 
-The agent queries your VPC flow logs in S3 via Athena, enriches each flow with resource metadata, and classifies traffic by type. The hosted API runs 14 detection patterns against the aggregated summaries.
+Every scan snapshots your VPC topology — subnets, internet gateways, NAT gateways, VPC endpoints, peering connections, routing tables, and flow log coverage across all in-scope VPCs. The dashboard gives you a current-state map of your network without needing AWS Config.
 
-| Traffic type | Typical cost |
+### 2. Topology change history
+
+Each scan diffs the current snapshot against the previous one. Changes are recorded with severity:
+
+| Severity | Example |
 |---|---|
-| S3 traffic routed via NAT gateway | Avoidable — VPC endpoint is free |
-| Cross-AZ transfers | $0.01/GB |
-| Cross-region traffic | $0.02/GB |
-| Internet egress | $0.09/GB |
-| Redundant/duplicate transfer paths | Varies |
+| `critical` | Internet gateway attached to a previously internal VPC |
+| `high` | New VPC peering connection, inbound security group rule added |
+| `medium` | Subnet route table changed, NAT gateway added |
+| `low` | Tag update, description change |
 
-Findings include the estimated monthly cost and the specific resources responsible (instance IDs, VPC IDs, NAT gateway IDs).
+No Config rules or CloudTrail queries needed — you get a searchable change log from the first scan.
 
-### Compliance gap identification
+### 3. Compliance gap identification
 
 Four posture collectors snapshot your configuration on every scan. The hosted API runs checks against each snapshot and tracks findings across scans — flagging new issues and resolving old ones when config is fixed.
 
@@ -48,22 +51,19 @@ Four posture collectors snapshot your configuration on every scan. The hosted AP
 
 The agent collects only the **key names** of environment variables and SSM parameters. Values never leave your account.
 
-### VPC network visibility
+### 4. Network cost leak detection
 
-Every scan snapshots your VPC topology — subnets, internet gateways, NAT gateways, VPC endpoints, peering connections, routing tables, and flow log coverage across all in-scope VPCs. The dashboard gives you a current-state map of your network without needing AWS Config.
+The agent queries your VPC flow logs in S3 via Athena, enriches each flow with resource metadata, and classifies traffic by type. The hosted API runs 14 detection patterns against the aggregated summaries.
 
-### Topology change history
-
-Each scan diffs the current snapshot against the previous one. Changes are stored with severity:
-
-| Severity | Example |
+| Traffic type | Typical cost |
 |---|---|
-| `critical` | Internet gateway attached to a previously internal VPC |
-| `high` | New VPC peering connection, inbound security group rule added |
-| `medium` | Subnet route table changed, NAT gateway added |
-| `low` | Tag update, description change |
+| S3 traffic routed via NAT gateway | Avoidable — VPC endpoint is free |
+| Cross-AZ transfers | $0.01/GB |
+| Cross-region traffic | $0.02/GB |
+| Internet egress | $0.09/GB |
+| Redundant/duplicate transfer paths | Varies |
 
-No Config rules or CloudTrail queries needed — you get a searchable change log from the first scan.
+Findings include the estimated monthly cost and the specific resources responsible (instance IDs, VPC IDs, NAT gateway IDs).
 
 ---
 
