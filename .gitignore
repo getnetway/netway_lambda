@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+.env_*
 
 # Internal Netlytix release tooling — not for public repo
 publish.sh
@@ -20,6 +21,7 @@ __pycache__/
 .venv/
 venv/
 env/
+
 
 # Athena query results (local testing)
 /tmp/

@@ -1,1 +1,1 @@
-"""Netway — Egress Fee Optimizer."""
+"""Netway — AWS Network Cost Analyzer."""

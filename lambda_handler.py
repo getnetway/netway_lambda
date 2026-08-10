@@ -5,7 +5,7 @@ Responsibility (post-refactor):
   2. Build IP → resource map
   3. Enrich and classify flows
   4. Pre-aggregate to reduce payload size
-  5. POST aggregated flows + metadata to Netway API (/api/v1/ingest)
+  5. POST aggregated flows + metadata to Netway API (/v1/cost/ingest)
   6. API server runs detectors, saves findings, sends notifications
 
 Detection logic no longer lives in the Lambda.
@@ -268,11 +268,12 @@ def _post_flows_to_api(
     import httpx
     try:
         resp = httpx.post(
-            f"{api_url}/api/v1/ingest",
+            f"{api_url}/v1/cost/ingest",
             content=compressed,
             headers={
                 "x-api-key":          api_key,
                 "x-netway-signature": signature,
+                "X-Aws-Account-Id":   account_id,
                 "Content-Encoding":   "gzip",
                 "Content-Type":       "application/json",
             },
@@ -310,7 +311,7 @@ def report_marketplace_usage() -> None:
         logger.warning("MARKETPLACE_PRODUCT_CODE not set — skipping metering")
         return
     tier = os.environ.get("NETWAY_TIER", "starter").lower()
-    dimension = tier if tier in {"starter", "growth", "scale"} else "starter"
+    dimension = tier if tier in {"starter", "standard", "enterprise"} else "starter"
     try:
         client = boto3.client("meteringmarketplace", region_name="us-east-1")
         response = client.meter_usage(
@@ -333,12 +334,59 @@ def report_marketplace_usage() -> None:
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
+def _run_topology_scan(config: dict, session: boto3.Session) -> dict:
+    from netway.topology.collector import TopologyCollector
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    collector = TopologyCollector(session, config["aws_regions"], account_id)
+    return collector.collect_all()
+
+
+def _post_topology_to_api(data: dict, config: dict) -> None:
+    import httpx
+    payload = json.dumps(data).encode()
+    compressed = gzip.compress(payload)
+    sig = hmac.new(config["api_key"].encode(), compressed, hashlib.sha256).hexdigest()
+    account_id = data.get("account_id", "")
+    resp = httpx.post(
+        f"{config['api_url']}/v1/topology/ingest",
+        content=compressed,
+        headers={
+            "Content-Encoding":  "gzip",
+            "Content-Type":      "application/json",
+            "X-API-Key":         config["api_key"],
+            "X-Signature":       sig,
+            "X-Aws-Account-Id":  account_id,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+
+def _post_posture_to_api(snapshot: dict, config: dict) -> None:
+    import httpx
+    payload = json.dumps(snapshot).encode()
+    sig = hmac.new(config["api_key"].encode(), payload, hashlib.sha256).hexdigest()
+    resp = httpx.post(
+        f"{config['api_url']}/v1/posture/ingest",
+        content=payload,
+        headers={
+            "Content-Type":        "application/json",
+            "X-API-Key":           config["api_key"],
+            "X-Netway-Signature":  f"sha256={sig}",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+
 def handler(event: dict, context) -> dict:
     """
     Lambda entry point.
 
-    Queries flow logs, enriches, aggregates, and ships to API server.
-    Detection runs server-side.
+    PRIMARY: topology scan — collects VPC/TGW/peering topology, POSTs to API.
+    SECONDARY: flow log cost analysis — queries Athena, POSTs to API.
+    Topology failure surfaces as Lambda failure (EventBridge retries).
+    Flow log failure is a warning only.
     """
     from netway.config import validate_config
     from netway.providers import get_provider
@@ -348,6 +396,37 @@ def handler(event: dict, context) -> dict:
 
     clear_ip_map_cache()
     validate_config()
+
+    api_url = os.environ.get("NETWAY_API_URL", "")
+    api_key = os.environ.get("NETWAY_API_KEY", "")
+    aws_regions = [r.strip() for r in os.environ.get(
+        "AWS_REGIONS", os.environ.get("AWS_REGION", "us-east-1")
+    ).split(",") if r.strip()]
+    topology_config = {"api_url": api_url, "api_key": api_key, "aws_regions": aws_regions}
+
+    session = boto3.Session()
+
+    # ── PRIMARY: topology scan ────────────────────────────────────────────────
+    topology_ok = False
+    try:
+        topology_data = _run_topology_scan(topology_config, session)
+        _post_topology_to_api(topology_data, topology_config)
+        topology_ok = True
+        logger.info("topology_scan posted successfully")
+    except Exception as exc:
+        logger.error("topology_scan failed: %s", exc, exc_info=True)
+
+    # ── SECONDARY: posture scan ───────────────────────────────────────────────
+    try:
+        from netway.posture import collect_posture
+        sts = boto3.client("sts")
+        posture_account_id = sts.get_caller_identity()["Account"]
+        posture_snapshot = collect_posture(session, aws_regions, posture_account_id)
+        _post_posture_to_api(posture_snapshot, topology_config)
+        logger.info("posture_scan posted successfully")
+    except Exception as exc:
+        logger.warning("posture_scan failed (non-fatal): %s", exc)
+
     provider  = get_provider()
     trigger   = event.get("trigger", "scheduled")
     scan_id   = str(uuid.uuid4())
@@ -433,35 +512,40 @@ def handler(event: dict, context) -> dict:
         total_flow_groups += len(aggregated)
         logger.info("Region %s: %d flows → %d aggregated groups", region, len(flows), len(aggregated))
 
-    if not regions_data:
-        logger.info("No flow data across all regions — nothing to post")
-        return {"statusCode": 200, "message": "no_flows"}
-
-    report_marketplace_usage()
-
-    # ── Ship to API server ────────────────────────────────────────────────────
-    job_id = "unknown"
+    # ── SECONDARY: flow log cost analysis (non-fatal) ────────────────────────
+    flow_result: dict = {}
     try:
-        job_id = _post_flows_to_api(
-            regions_data=regions_data,
-            scan_id=scan_id,
-            account_id=account_id,
-            provider=provider.provider_name,
-            analysis_days=analysis_days,
-        )
-    except TrialExpiredError as e:
-        logger.error("NETWAY TRIAL EXPIRED — %s", e)
-        return {"statusCode": 402, "error": "trial_expired", "message": str(e)}
+        if not regions_data:
+            logger.info("No flow data across all regions — nothing to post")
+        else:
+            report_marketplace_usage()
+            job_id = "unknown"
+            try:
+                job_id = _post_flows_to_api(
+                    regions_data=regions_data,
+                    scan_id=scan_id,
+                    account_id=account_id,
+                    provider=provider.provider_name,
+                    analysis_days=analysis_days,
+                )
+            except TrialExpiredError as e:
+                logger.error("NETWAY TRIAL EXPIRED — %s", e)
+                flow_result = {"statusCode": 402, "error": "trial_expired", "message": str(e)}
+            else:
+                logger.info("Scan complete: scan_id=%s job_id=%s total_groups=%d",
+                            scan_id, job_id, total_flow_groups)
+                flow_result = {
+                    "statusCode":        200,
+                    "scan_id":           scan_id,
+                    "job_id":            job_id,
+                    "regions":           list(regions_data.keys()),
+                    "total_flow_groups": total_flow_groups,
+                }
     except Exception as e:
-        logger.error("Failed to ship flows to API: %s", e)
-        return {"statusCode": 500, "error": "ingest_failed", "message": str(e)}
+        logger.warning("flow_log_analysis failed (non-fatal): %s", e)
 
-    logger.info("Scan complete: scan_id=%s job_id=%s total_groups=%d",
-                scan_id, job_id, total_flow_groups)
-    return {
-        "statusCode":        200,
-        "scan_id":           scan_id,
-        "job_id":            job_id,
-        "regions":           list(regions_data.keys()),
-        "total_flow_groups": total_flow_groups,
-    }
+    # Topology is primary — surface failure so EventBridge retries
+    if not topology_ok:
+        raise RuntimeError("topology_scan failed — see CloudWatch logs")
+
+    return flow_result or {"statusCode": 200, "message": "no_flows"}

@@ -1,15 +1,43 @@
+# Version: 1.1.0
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Netway Egress Fee Optimizer
+Description: Netway - AWS Network Cost Analyzer
 
 Parameters:
   NetwayApiKey:
     Type: String
     NoEcho: true
 
+  AthenaDatabase:
+    Type: String
+    Default: "netway"
+    Description: >
+      Glue/Athena database name. Use "netway_staging" for staging deployments
+      to avoid sharing the prod Glue catalog table.
+
   NetwayApiUrl:
     Type: String
-    Default: https://api.getnetway.dev
+    Default: https://api.basavytix.com/netway
     Description: Netway API server URL
+
+  LambdaZipBucket:
+    Type: String
+    Default: ""
+    Description: >
+      S3 bucket containing the Lambda zip. Leave empty to use the default
+      netway-bootstrap-{AccountId}-{Region} bucket.
+
+  LambdaZipKey:
+    Type: String
+    Default: lambda/latest.zip
+    Description: S3 key of the Lambda zip file.
+
+  StackSuffix:
+    Type: String
+    Default: ""
+    Description: >
+      Optional suffix appended to all named resources (Lambda, IAM role, Athena workgroup, S3 bucket).
+      Use "-staging" to deploy a staging stack alongside prod without name conflicts.
+      Leave empty for production deployments.
 
   VpcIds:
     Type: String
@@ -60,111 +88,9 @@ Parameters:
 
 Conditions:
   CreateBucket: !Equals [!Ref ExistingBucketName, ""]
+  UseCustomLambdaBucket: !Not [!Equals [!Ref LambdaZipBucket, ""]]
 
 Resources:
-
-  # ── Bootstrap: copy Lambda zip into a local S3 bucket ───────────────────────
-  # The Netway Lambda zip is hosted in ap-south-1. CloudFormation requires the
-  # source bucket to be in the same region as the Lambda. This Custom Resource
-  # downloads the zip at stack-create time and places it in a local bucket so
-  # the stack can be deployed to any region without pre-creating regional buckets.
-
-  BootstrapBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    Properties:
-      BucketName: !Sub "netway-bootstrap-${AWS::AccountId}-${AWS::Region}"
-
-  BootstrapRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: BootstrapPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:DeleteObject
-                Resource: !Sub "${BootstrapBucket.Arn}/*"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-
-  BootstrapFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "netway-bootstrap-${AWS::Region}"
-      Runtime: python3.11
-      Handler: index.handler
-      Timeout: 300
-      Role: !GetAtt BootstrapRole.Arn
-      Code:
-        ZipFile: |
-          import boto3, json, urllib.request
-
-          def cfn_send(event, context, status, data=None):
-              body = json.dumps({
-                  "Status": status,
-                  "Reason": str(data or ""),
-                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
-                  "StackId": event["StackId"],
-                  "RequestId": event["RequestId"],
-                  "LogicalResourceId": event["LogicalResourceId"],
-                  "Data": data if isinstance(data, dict) else {},
-              }).encode()
-              req = urllib.request.Request(
-                  event["ResponseURL"],
-                  data=body,
-                  headers={"Content-Type": "", "Content-Length": str(len(body))},
-                  method="PUT",
-              )
-              urllib.request.urlopen(req)
-
-          def handler(event, context):
-              try:
-                  props = event["ResourceProperties"]
-                  bucket = props["Bucket"]
-                  key = props["Key"]
-                  source_url = props["SourceUrl"]
-
-                  if event["RequestType"] == "Delete":
-                      try:
-                          boto3.client("s3").delete_object(Bucket=bucket, Key=key)
-                      except Exception:
-                          pass
-                      cfn_send(event, context, "SUCCESS")
-                      return
-
-                  # Download zip from public URL and upload to the local bucket
-                  with urllib.request.urlopen(source_url) as resp:
-                      data = resp.read()
-                  boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=data)
-                  cfn_send(event, context, "SUCCESS", {"Bucket": bucket, "Key": key})
-              except Exception as e:
-                  cfn_send(event, context, "FAILED", {"Error": str(e)})
-
-  BootstrapResource:
-    Type: Custom::BootstrapLambdaZip
-    DependsOn: BootstrapBucket
-    Properties:
-      ServiceToken: !GetAtt BootstrapFunction.Arn
-      Bucket: !Ref BootstrapBucket
-      Key: lambda/latest.zip
-      SourceUrl: https://netway-public-releases.s3.amazonaws.com/lambda/latest.zip
-      # Bump SourceVersion to force re-download on stack update (e.g. after a Lambda release)
-      SourceVersion: "1"
 
   # ── S3 (flow logs + Athena results) ─────────────────────────────────────────
   NetwayBucket:
@@ -172,7 +98,7 @@ Resources:
     Condition: CreateBucket
     DeletionPolicy: Retain
     Properties:
-      BucketName: !Sub "netway-${AWS::AccountId}-${AWS::Region}"
+      BucketName: !Sub "netway-${AWS::AccountId}-${AWS::Region}${StackSuffix}"
       LifecycleConfiguration:
         Rules:
           - Id: ExpireFlowLogs
@@ -262,7 +188,7 @@ Resources:
   FlowLogEnablerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "netway-flow-log-enabler-${AWS::Region}"
+      FunctionName: !Sub "netway-flow-log-enabler-${AWS::Region}${StackSuffix}"
       Runtime: python3.11
       Handler: index.handler
       Timeout: 300
@@ -398,7 +324,7 @@ Resources:
   NetwayRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "netway-analyzer-${AWS::Region}"
+      RoleName: !Sub "netway-analyzer-${AWS::Region}${StackSuffix}"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -449,10 +375,24 @@ Resources:
                   - ec2:DescribeNatGateways
                   - ec2:DescribeRouteTables
                   - ec2:DescribeAddresses
+                  - ec2:DescribeVpcPeeringConnections
+                  - ec2:DescribeTransitGateways
+                  - ec2:DescribeTransitGatewayAttachments
+                  - ec2:DescribeTransitGatewayRouteTables
+                  - ec2:DescribeTransitGatewayRouteTablePropagations
+                  - ec2:DescribeTransitGatewayRouteTableAssociations
+                  - ec2:SearchTransitGatewayRoutes
+                  - ec2:GetTransitGatewayRouteTablePropagations
+                  - ec2:DescribeInternetGateways
                   - rds:DescribeDBInstances
                   - rds:DescribeDBSubnetGroups
                   - elasticloadbalancing:DescribeLoadBalancers
                   - lambda:ListFunctions
+                  - lambda:GetFunctionConfiguration
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkAcls
+                  - ec2:DescribeFlowLogs
+                  - ssm:DescribeParameters
                   - sagemaker:ListEndpoints
                   - sagemaker:ListTrainingJobs
                   - elasticache:DescribeReplicationGroups
@@ -474,7 +414,7 @@ Resources:
   NetwayWorkgroup:
     Type: AWS::Athena::WorkGroup
     Properties:
-      Name: netway-analyzer
+      Name: !Sub "netway-analyzer${StackSuffix}"
       RecursiveDeleteOption: true
       WorkGroupConfiguration:
         EnforceWorkGroupConfiguration: true
@@ -488,24 +428,26 @@ Resources:
   # ── Lambda ──────────────────────────────────────────────────────────────────
   NetwayFunction:
     Type: AWS::Lambda::Function
-    DependsOn: BootstrapResource
     Properties:
-      FunctionName: netway-analyzer
+      FunctionName: !Sub "netway-analyzer${StackSuffix}"
       Runtime: python3.11
       Handler: lambda_handler.handler
       Timeout: 900
       MemorySize: 1024
       Code:
-        S3Bucket: !Ref BootstrapBucket
-        S3Key: lambda/latest.zip
+        S3Bucket: !If
+          - UseCustomLambdaBucket
+          - !Ref LambdaZipBucket
+          - !Sub "netway-bootstrap-${AWS::AccountId}-${AWS::Region}${StackSuffix}"
+        S3Key: !Ref LambdaZipKey
       Environment:
         Variables:
           NETWAY_API_KEY: !Ref NetwayApiKey
           NETWAY_API_URL: !Ref NetwayApiUrl
           FLOW_LOGS_S3_BUCKET: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
           ATHENA_RESULTS_BUCKET: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
-          ATHENA_WORKGROUP: netway-analyzer
-          ATHENA_DATABASE: netway
+          ATHENA_WORKGROUP: !Sub "netway-analyzer${StackSuffix}"
+          ATHENA_DATABASE: !Ref AthenaDatabase
           CLOUD_PROVIDER: aws
           ANALYSIS_DAYS: !Sub "${AnalysisDays}"
           FLOW_LOG_SOURCE: s3_athena
@@ -535,18 +477,18 @@ Resources:
   WeeklySchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: netway-weekly-scan
-      ScheduleExpression: rate(7 days)
+      Name: !Sub "netway-6h-scan${StackSuffix}"
+      ScheduleExpression: rate(6 hours)
       State: ENABLED
       Targets:
         - Arn: !GetAtt NetwayFunction.Arn
-          Id: NetwayWeeklyScan
+          Id: Netway6hScan
           Input: '{"trigger": "scheduled"}'
 
   NewResourceTrigger:
     Type: AWS::Events::Rule
     Properties:
-      Name: netway-new-resource
+      Name: !Sub "netway-new-resource${StackSuffix}"
       EventPattern:
         source: ["aws.ec2"]
         detail-type: ["AWS API Call via CloudTrail"]
@@ -566,6 +508,10 @@ Outputs:
   BucketName:
     Value: !If [CreateBucket, !Ref NetwayBucket, !Ref ExistingBucketName]
     Description: Netway-managed S3 bucket (flow logs + Athena results, with lifecycle auto-cleanup)
+
+  LambdaFunctionName:
+    Value: !Sub "netway-analyzer${StackSuffix}"
+    Description: Netway Lambda function name
 
   FunctionArn:
     Value: !GetAtt NetwayFunction.Arn
