@@ -10,12 +10,12 @@ VPC observability for AWS — network visibility, topology change history, compl
 
 ## The problem
 
-AWS makes it easy to start but hard to understand what's actually running and what it costs:
+AWS gives you building blocks but no unified view of what you've built:
 
-- **NAT gateway bills are opaque.** $800/month shows up as a line item with no breakdown by workload or traffic type. S3 traffic routed through NAT instead of a VPC endpoint can silently cost thousands per month — and you won't see it without querying flow logs yourself.
-- **Cross-AZ transfer is invisible.** $0.01/GB × millions of internal service calls adds up fast. Nothing in the AWS console tells you which services are responsible.
-- **Security posture has no free central view.** Finding every security group with `0.0.0.0/0` ingress, every SSM parameter storing a secret unencrypted, every Lambda with a plaintext API key in its environment — this requires AWS Config or Security Hub, which cost more than the problems they find.
-- **Network topology changes leave no trail** unless you've pre-configured Config rules or CloudTrail queries. A new internet gateway attachment or a peering connection added last Tuesday? No record unless you were looking.
+- **Your VPC topology lives across a dozen console pages.** Subnets, gateways, peering connections, endpoints, route tables — there is no single screen that shows how they fit together across regions. You reconstruct the picture manually when something breaks.
+- **Network changes leave no trail by default.** A new internet gateway attachment, a peering connection someone added, a route table entry that appeared last week — none of this is tracked unless you pre-configure AWS Config rules or CloudTrail queries before the change happens.
+- **Security posture has no free central view.** Finding every security group with `0.0.0.0/0` ingress, every SSM parameter storing a secret as plaintext, every Lambda with credentials in its environment variables — this requires AWS Config or Security Hub, both expensive to run continuously at scale.
+- **Network transfer costs are a black box.** NAT gateway, cross-AZ, and cross-region charges appear as line items with no breakdown by workload, VPC, or traffic type. The only way to understand them is to query VPC flow logs yourself — which most teams never do.
 
 ---
 
@@ -55,13 +55,13 @@ The agent collects only the **key names** of environment variables and SSM param
 
 The agent queries your VPC flow logs in S3 via Athena, enriches each flow with resource metadata, and classifies traffic by type. The hosted API runs 14 detection patterns against the aggregated summaries.
 
-| Traffic type | Typical cost |
+| Traffic type | Why it matters |
 |---|---|
-| S3 traffic routed via NAT gateway | Avoidable — VPC endpoint is free |
-| Cross-AZ transfers | $0.01/GB |
-| Cross-region traffic | $0.02/GB |
-| Internet egress | $0.09/GB |
-| Redundant/duplicate transfer paths | Varies |
+| S3 traffic routed via NAT gateway | Avoidable — a VPC endpoint costs nothing |
+| Cross-AZ transfers | Billed per GB, accumulates fast in microservices |
+| Cross-region traffic | Higher per-GB cost, easy to miss in multi-region setups |
+| Internet egress | Highest cost category, often driven by a single misconfigured workload |
+| Redundant/duplicate transfer paths | Duplicate routes that silently double transfer costs |
 
 Findings include the estimated monthly cost and the specific resources responsible (instance IDs, VPC IDs, NAT gateway IDs).
 
